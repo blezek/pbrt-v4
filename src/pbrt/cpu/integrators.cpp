@@ -2224,13 +2224,13 @@ void BDPTIntegrator::Render() {
                 std::string filename =
                     StringPrintf("bdpt_d%02i_s%02i_t%02i.exr", depth, s, t);
 
-                // FIXME: leaks
-                weightFilms[BufferIndex(s, t)] = new RGBFilm(
-                    Sensor::CreateDefault(), camera.GetFilm().FullResolution(),
+                FilmBaseParameters p(
+                    camera.GetFilm().FullResolution(),
                     Bounds2i(Point2i(0, 0), camera.GetFilm().FullResolution()),
                     new BoxFilter,  // FIXME: leaks
-                    camera.GetFilm().Diagonal() * 1000, filename, 1.f,
-                    RGBColorSpace::sRGB);
+                    camera.GetFilm().Diagonal() * 1000, PixelSensor::CreateDefault(),
+                    filename);
+                weightFilms[BufferIndex(s, t)] = new RGBFilm(p, RGBColorSpace::sRGB);
             }
         }
     }
@@ -2790,12 +2790,7 @@ void SPPMIntegrator::Render() {
     for (int i = 0; i < MaxThreadIndex(); ++i)
         // TODO: size this
         perThreadScratchBuffers.push_back(ScratchBuffer(nPixels * 1024));
-    const Sensor *sensor = camera.GetFilm().GetSensor();
-    auto ToSensorRGB = [&](const SampledSpectrum &L,
-                           const SampledWavelengths &lambda) -> RGB {
-        SampledSpectrum H = L * sensor->ImagingRatio();
-        return sensor->ToCameraRGB(H, lambda);
-    };
+    FilmHandle film = camera.GetFilm();
 
     for (int iter = 0; iter < nIterations; ++iter) {
         // Generate SPPM visible points
@@ -2840,7 +2835,7 @@ void SPPMIntegrator::Render() {
                                 for (const auto &light : infiniteLights) {
                                     SampledSpectrum L = beta * light.Le(ray, lambda);
                                     L = SafeDiv(L, lambda.PDF());
-                                    pixel.Ld += ToSensorRGB(L, lambda);
+                                    pixel.Ld += film.ToOutputRGB(L, lambda);
                                 }
                             }
 
@@ -2869,11 +2864,12 @@ void SPPMIntegrator::Render() {
                         if (depth == 0 || specularBounce) {
                             SampledSpectrum L = beta * isect.Le(wo, lambda);
                             L = SafeDiv(L, lambda.PDF());
-                            pixel.Ld += ToSensorRGB(L, lambda);
+                            pixel.Ld += film.ToOutputRGB(L, lambda);
                         }
                         SampledSpectrum Ld = SampleLd(isect, bsdf, lambda, tileSampler,
                                                       &directLightSampler);
-                        pixel.Ld += ToSensorRGB(SafeDiv(beta * Ld, lambda.PDF()), lambda);
+                        pixel.Ld +=
+                            film.ToOutputRGB(SafeDiv(beta * Ld, lambda.PDF()), lambda);
 
                         // Possibly create visible point and end camera path
                         if (bsdf.IsDiffuse() ||
@@ -3107,7 +3103,8 @@ void SPPMIntegrator::Render() {
                 SampledSpectrum Phi;
                 for (int j = 0; j < NSpectrumSamples; ++j)
                     Phi[j] = p.Phi[j];
-                RGB rgb = ToSensorRGB(SafeDiv(p.vp.beta * Phi, lambda.PDF()), lambda);
+                RGB rgb =
+                    film.ToOutputRGB(SafeDiv(p.vp.beta * Phi, lambda.PDF()), lambda);
                 p.tau = (p.tau + rgb) * (Rnew * Rnew) / (p.radius * p.radius);
                 p.N = Nnew;
                 p.radius = Rnew;

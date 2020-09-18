@@ -64,10 +64,6 @@ class SpectrumHandle : public TaggedPointer<ConstantSpectrum, DenselySampledSpec
 };
 
 // Spectrum Function Declarations
-Float SpectrumToY(SpectrumHandle s);
-Float SpectrumToPhotometric(SpectrumHandle s);
-XYZ SpectrumToXYZ(SpectrumHandle s);
-
 PBRT_CPU_GPU inline Float Blackbody(Float lambda, Float T) {
     if (T <= 0)
         return 0;
@@ -85,6 +81,9 @@ namespace Spectra {
 DenselySampledSpectrum D(Float temperature, Allocator alloc);
 }  // namespace Spectra
 Float SpectrumToPhotometric(SpectrumHandle s);
+
+Float SpectrumToPhotometric(SpectrumHandle s);
+XYZ SpectrumToXYZ(SpectrumHandle s);
 
 // SampledSpectrum Definition
 class SampledSpectrum {
@@ -475,30 +474,47 @@ class PiecewiseLinearSpectrum {
                                                Allocator alloc);
 
     static PiecewiseLinearSpectrum *FromInterleaved(pstd::span<const Float> samples,
-                                                    bool normalize, Allocator alloc) {
-        CHECK_EQ(0, samples.size() % 2);
-        int n = samples.size() / 2;
-        std::vector<Float> lambda(n), v(n);
-        for (size_t i = 0; i < n; ++i) {
-            lambda[i] = samples[2 * i];
-            v[i] = samples[2 * i + 1];
-            if (i > 0)
-                CHECK_GT(lambda[i], lambda[i - 1]);
-        }
-
-        PiecewiseLinearSpectrum *spec =
-            alloc.new_object<pbrt::PiecewiseLinearSpectrum>(lambda, v, alloc);
-
-        if (normalize)
-            // Normalize to have luminance of 1.
-            spec->Scale(1 / SpectrumToY(spec));
-
-        return spec;
-    }
+                                                    bool normalize, Allocator alloc);
 
   private:
     // PiecewiseLinearSpectrum Private Members
     pstd::vector<Float> lambdas, values;
+};
+
+class BlackbodySpectrum {
+  public:
+    // BlackbodySpectrum Public Methods
+    PBRT_CPU_GPU
+    BlackbodySpectrum(Float T) : T(T) {
+        // Compute blackbody normalization constant for given temperature
+        Float lambdaMax = Float(2.8977721e-3 / T * 1e9);
+        normalizationFactor = 1 / Blackbody(lambdaMax, T);
+    }
+
+    PBRT_CPU_GPU
+    Float operator()(Float lambda) const {
+        return Blackbody(lambda, T) * normalizationFactor;
+    }
+
+    PBRT_CPU_GPU
+    SampledSpectrum Sample(const SampledWavelengths &lambda) const {
+        SampledSpectrum s;
+        for (int i = 0; i < NSpectrumSamples; ++i)
+            s[i] = Blackbody(lambda[i], T) * normalizationFactor;
+        return s;
+    }
+
+    PBRT_CPU_GPU
+    Float MaxValue() const { return 1.f; }
+
+    std::string ToString() const;
+    std::string ParameterType() const;
+    std::string ParameterString() const;
+
+  private:
+    // BlackbodySpectrum Private Members
+    Float T;
+    Float normalizationFactor;
 };
 
 class RGBReflectanceSpectrum {
@@ -566,42 +582,6 @@ class RGBSpectrum {
     Float scale;
     RGBSigmoidPolynomial rsp;
     const DenselySampledSpectrum *illuminant;
-};
-
-class BlackbodySpectrum {
-  public:
-    // BlackbodySpectrum Public Methods
-    PBRT_CPU_GPU
-    BlackbodySpectrum(Float T) : T(T) {
-        // Compute blackbody normalization constant for given temperature
-        Float lambdaMax = Float(2.8977721e-3 / T * 1e9);
-        normalizationFactor = 1 / Blackbody(lambdaMax, T);
-    }
-
-    PBRT_CPU_GPU
-    Float operator()(Float lambda) const {
-        return Blackbody(lambda, T) * normalizationFactor;
-    }
-
-    PBRT_CPU_GPU
-    SampledSpectrum Sample(const SampledWavelengths &lambda) const {
-        SampledSpectrum s;
-        for (int i = 0; i < NSpectrumSamples; ++i)
-            s[i] = Blackbody(lambda[i], T) * normalizationFactor;
-        return s;
-    }
-
-    PBRT_CPU_GPU
-    Float MaxValue() const { return 1.f; }
-
-    std::string ToString() const;
-    std::string ParameterType() const;
-    std::string ParameterString() const;
-
-  private:
-    // BlackbodySpectrum Private Members
-    Float T;
-    Float normalizationFactor;
 };
 
 // SampledSpectrum Inline Functions
@@ -738,6 +718,14 @@ inline const DenselySampledSpectrum &X();
 inline const DenselySampledSpectrum &Y();
 inline const DenselySampledSpectrum &Z();
 }  // namespace Spectra
+
+// Spectrum Inline Functions
+inline Float InnerProduct(SpectrumHandle a, SpectrumHandle b) {
+    Float result = 0;
+    for (Float lambda = Lambda_min; lambda <= Lambda_max; ++lambda)
+        result += a(lambda) * b(lambda);
+    return result / CIE_Y_integral;
+}
 
 // SpectrumHandle Inline Method Definitions
 inline Float SpectrumHandle::operator()(Float lambda) const {

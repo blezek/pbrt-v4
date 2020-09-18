@@ -202,12 +202,12 @@ STAT_MEMORY_COUNTER("Memory/Light image and distributions", imageBytes);
 // ProjectionLight Method Definitions
 ProjectionLight::ProjectionLight(const Transform &renderFromLight,
                                  const MediumInterface &mediumInterface, Image im,
-                                 const RGBColorSpace *imageColorSpace, Float scale,
+                                 const RGBColorSpace *imageColorSpace, Float lscale,
                                  Float fov, Float phi_v, Allocator alloc)
     : LightBase(LightType::DeltaPosition, renderFromLight, mediumInterface),
       image(std::move(im)),
       imageColorSpace(imageColorSpace),
-      scale(scale),
+      scale(lscale),
       distrib(alloc) {
     // Initialize ProjectionLight projection matrix
     Float aspect = Float(image.Resolution().x) / Float(image.Resolution().y);

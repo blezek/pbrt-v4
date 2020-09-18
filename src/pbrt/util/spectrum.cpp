@@ -31,16 +31,6 @@
 namespace pbrt {
 
 // Spectrum Function Definitions
-XYZ SpectrumToXYZ(SpectrumHandle s) {
-    XYZ xyz;
-    for (Float lambda = Lambda_min; lambda <= Lambda_max; ++lambda) {
-        xyz.X += Spectra::X()(lambda) * s(lambda);
-        xyz.Y += Spectra::Y()(lambda) * s(lambda);
-        xyz.Z += Spectra::Z()(lambda) * s(lambda);
-    }
-    return xyz / CIE_Y_integral;
-}
-
 Float SpectrumToPhotometric(SpectrumHandle s) {
     // We have to handle RGBSpectrum separately here as it's composed of an
     // illuminant spectrum and an RGB multiplier. We only want to consider the
@@ -55,6 +45,11 @@ Float SpectrumToPhotometric(SpectrumHandle s) {
         y += Spectra::Y()(lambda) * s(lambda);
 
     return y * K_m;
+}
+
+XYZ SpectrumToXYZ(SpectrumHandle s) {
+    return XYZ(InnerProduct(&Spectra::X(), s), InnerProduct(&Spectra::Y(), s),
+               InnerProduct(&Spectra::Z(), s));
 }
 
 std::string SpectrumHandle::ToString() const {
@@ -73,13 +68,6 @@ std::string SpectrumHandle::ParameterType() const {
 std::string SpectrumHandle::ParameterString() const {
     auto ps = [&](auto ptr) { return ptr->ParameterString(); };
     return DispatchCPU(ps);
-}
-
-Float SpectrumToY(SpectrumHandle s) {
-    Float y = 0;
-    for (Float lambda = Lambda_min; lambda <= Lambda_max; ++lambda)
-        y += Spectra::Y()(lambda) * s(lambda);
-    return y / CIE_Y_integral;
 }
 
 // Spectrum Method Definitions
@@ -157,6 +145,28 @@ pstd::optional<SpectrumHandle> PiecewiseLinearSpectrum::Read(const std::string &
             alloc.new_object<PiecewiseLinearSpectrum>(lambda, v, alloc);
         return handle;
     }
+}
+
+PiecewiseLinearSpectrum *PiecewiseLinearSpectrum::FromInterleaved(
+    pstd::span<const Float> samples, bool normalize, Allocator alloc) {
+    CHECK_EQ(0, samples.size() % 2);
+    int n = samples.size() / 2;
+    std::vector<Float> lambda(n), v(n);
+    for (size_t i = 0; i < n; ++i) {
+        lambda[i] = samples[2 * i];
+        v[i] = samples[2 * i + 1];
+        if (i > 0)
+            CHECK_GT(lambda[i], lambda[i - 1]);
+    }
+
+    PiecewiseLinearSpectrum *spec =
+        alloc.new_object<pbrt::PiecewiseLinearSpectrum>(lambda, v, alloc);
+
+    if (normalize)
+        // Normalize to have luminance of 1.
+        spec->Scale(1 / InnerProduct(spec, &Spectra::Y()));
+
+    return spec;
 }
 
 std::string BlackbodySpectrum::ToString() const {
@@ -2588,6 +2598,43 @@ const Float sony_ilce_9_b[] = {
 
 // Spectral Data Definitions
 namespace Spectra {
+DenselySampledSpectrum D(Float temperature, Allocator alloc) {
+    // Convert temperature to CCT
+    Float cct = temperature * 1.4388f / 1.4380f;
+    if (cct < 4000) {
+        // CIE D ill-defined, use blackbody
+        BlackbodySpectrum bb = BlackbodySpectrum(cct);
+        DenselySampledSpectrum blackbody = DenselySampledSpectrum::SampleFunction(
+            [=](Float lambda) { return bb(lambda); });
+
+        return blackbody;
+    }
+
+    // Convert CCT to xy
+    Float x;
+    if (cct <= 7000)
+        x = -4.607f * 1e9f / Pow<3>(cct) + 2.9678f * 1e6f / Sqr(cct) +
+            0.09911f * 1e3f / cct + 0.244063f;
+    else
+        x = -2.0064f * 1e9f / Pow<3>(cct) + 1.9018f * 1e6f / Sqr(cct) +
+            0.24748f * 1e3f / cct + 0.23704f;
+    Float y = -3 * x * x + 2.870f * x - 0.275f;
+
+    // Interpolate D spectrum
+    Float M = 0.0241f + 0.2562f * x - 0.7341f * y;
+    Float M1 = (-1.3515f - 1.7703f * x + 5.9114f * y) / M;
+    Float M2 = (0.0300f - 31.4424f * x + 30.0717f * y) / M;
+
+    pstd::vector<Float> values(nCIES);
+    for (int i = 0; i < nCIES; ++i)
+        values[i] = (CIE_S0[i] + CIE_S1[i] * M1 + CIE_S2[i] * M2) * 0.01;
+
+    PiecewiseLinearSpectrum dpls(CIE_S_lambda, values);
+    return DenselySampledSpectrum(&dpls, alloc);
+}
+}  // namespace Spectra
+
+namespace Spectra {
 
 #ifdef PBRT_BUILD_GPU_RENDERER
 PBRT_GPU DenselySampledSpectrum *xGPU, *yGPU, *zGPU;
@@ -2864,42 +2911,5 @@ std::string FindMatchingNamedSpectrum(SpectrumHandle s) {
     }
     return "";
 }
-
-namespace Spectra {
-DenselySampledSpectrum D(Float temperature, Allocator alloc) {
-    // Convert temperature to CCT
-    Float cct = temperature * 1.4388f / 1.4380f;
-    if (cct < 4000) {
-        // CIE D ill-defined, use blackbody
-        BlackbodySpectrum bb = BlackbodySpectrum(cct);
-        DenselySampledSpectrum blackbody = DenselySampledSpectrum::SampleFunction(
-            [=](Float lambda) { return bb(lambda); });
-
-        return blackbody;
-    }
-
-    // Convert CCT to xy
-    Float x;
-    if (cct <= 7000)
-        x = -4.607f * 1e9f / Pow<3>(cct) + 2.9678f * 1e6f / Sqr(cct) +
-            0.09911f * 1e3f / cct + 0.244063f;
-    else
-        x = -2.0064f * 1e9f / Pow<3>(cct) + 1.9018f * 1e6f / Sqr(cct) +
-            0.24748f * 1e3f / cct + 0.23704f;
-    Float y = -3 * x * x + 2.870f * x - 0.275f;
-
-    // Interpolate D spectrum
-    Float M = 0.0241f + 0.2562f * x - 0.7341f * y;
-    Float M1 = (-1.3515f - 1.7703f * x + 5.9114f * y) / M;
-    Float M2 = (0.0300f - 31.4424f * x + 30.0717f * y) / M;
-
-    pstd::vector<Float> values(nCIES);
-    for (int i = 0; i < nCIES; ++i)
-        values[i] = (CIE_S0[i] + CIE_S1[i] * M1 + CIE_S2[i] * M2) * 0.01;
-
-    PiecewiseLinearSpectrum dpls(CIE_S_lambda, values);
-    return DenselySampledSpectrum(&dpls, alloc);
-}
-}  // namespace Spectra
 
 }  // namespace pbrt

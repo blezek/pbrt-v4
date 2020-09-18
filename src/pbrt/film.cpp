@@ -18,6 +18,7 @@
 #include <pbrt/util/color.h>
 #include <pbrt/util/colorspace.h>
 #include <pbrt/util/error.h>
+#include <pbrt/util/file.h>
 #include <pbrt/util/image.h>
 #include <pbrt/util/lowdiscrepancy.h>
 #include <pbrt/util/memory.h>
@@ -58,6 +59,102 @@ std::string FilmHandle::GetFilename() const {
     return DispatchCPU(get);
 }
 
+// FilmBaseParameters Method Definitions
+FilmBaseParameters::FilmBaseParameters(const ParameterDictionary &parameters,
+                                       FilterHandle filter, const PixelSensor *sensor,
+                                       const FileLoc *loc)
+    : filter(filter), sensor(sensor) {
+    filename = parameters.GetOneString("filename", "");
+    if (!Options->imageFile.empty()) {
+        if (!filename.empty())
+            Warning(loc,
+                    "Output filename supplied on command line, \"%s\" will "
+                    "override "
+                    "filename provided in scene description file, \"%s\".",
+                    Options->imageFile, filename);
+        filename = Options->imageFile;
+    } else if (filename.empty())
+        filename = "pbrt.exr";
+
+    fullResolution = Point2i(parameters.GetOneInt("xresolution", 1280),
+                             parameters.GetOneInt("yresolution", 720));
+    if (Options->quickRender) {
+        fullResolution.x = std::max(1, fullResolution.x / 4);
+        fullResolution.y = std::max(1, fullResolution.y / 4);
+    }
+
+    pixelBounds = Bounds2i(Point2i(0, 0), fullResolution);
+    std::vector<int> pb = parameters.GetIntArray("pixelbounds");
+    if (Options->pixelBounds) {
+        Bounds2i newBounds = *Options->pixelBounds;
+        if (Intersect(newBounds, pixelBounds) != newBounds)
+            Warning(loc, "Supplied pixel bounds extend beyond image "
+                         "resolution. Clamping.");
+        pixelBounds = Intersect(newBounds, pixelBounds);
+
+        if (!pb.empty())
+            Warning(loc, "Both pixel bounds and crop window were specified. Using the "
+                         "crop window.");
+    } else if (!pb.empty()) {
+        if (pb.size() != 4)
+            Error(loc, "%d values supplied for \"pixelbounds\". Expected 4.",
+                  int(pb.size()));
+        else {
+            Bounds2i newBounds = Bounds2i({pb[0], pb[2]}, {pb[1], pb[3]});
+            if (Intersect(newBounds, pixelBounds) != newBounds)
+                Warning(loc, "Supplied pixel bounds extend beyond image "
+                             "resolution. Clamping.");
+            pixelBounds = Intersect(newBounds, pixelBounds);
+        }
+    }
+
+    std::vector<Float> cr = parameters.GetFloatArray("cropwindow");
+    if (Options->cropWindow) {
+        Bounds2f crop = *Options->cropWindow;
+        // Compute film image bounds
+        pixelBounds = Bounds2i(Point2i(std::ceil(fullResolution.x * crop.pMin.x),
+                                       std::ceil(fullResolution.y * crop.pMin.y)),
+                               Point2i(std::ceil(fullResolution.x * crop.pMax.x),
+                                       std::ceil(fullResolution.y * crop.pMax.y)));
+
+        if (!cr.empty())
+            Warning(loc, "Crop window supplied on command line will override "
+                         "crop window specified with Film.");
+        if (Options->pixelBounds || !pb.empty())
+            Warning(loc, "Both pixel bounds and crop window were specified. Using the "
+                         "crop window.");
+    } else if (!cr.empty()) {
+        if (Options->pixelBounds)
+            Warning(loc, "Ignoring \"cropwindow\" since pixel bounds were specified "
+                         "on the command line.");
+        else if (cr.size() == 4) {
+            if (!pb.empty())
+                Warning(loc, "Both pixel bounds and crop window were "
+                             "specified. Using the "
+                             "crop window.");
+
+            Bounds2f crop;
+            crop.pMin.x = Clamp(std::min(cr[0], cr[1]), 0.f, 1.f);
+            crop.pMax.x = Clamp(std::max(cr[0], cr[1]), 0.f, 1.f);
+            crop.pMin.y = Clamp(std::min(cr[2], cr[3]), 0.f, 1.f);
+            crop.pMax.y = Clamp(std::max(cr[2], cr[3]), 0.f, 1.f);
+
+            // Compute film image bounds
+            pixelBounds = Bounds2i(Point2i(std::ceil(fullResolution.x * crop.pMin.x),
+                                           std::ceil(fullResolution.y * crop.pMin.y)),
+                                   Point2i(std::ceil(fullResolution.x * crop.pMax.x),
+                                           std::ceil(fullResolution.y * crop.pMax.y)));
+        } else
+            Error(loc, "%d values supplied for \"cropwindow\". Expected 4.",
+                  (int)cr.size());
+    }
+
+    if (pixelBounds.IsEmpty())
+        ErrorExit(loc, "Degenerate pixel bounds provided to film: %s.", pixelBounds);
+
+    diagonal = parameters.GetOneFloat("diagonal", 35.);
+}
+
 // FilmBase Method Definitions
 std::string FilmBase::BaseToString() const {
     return StringPrintf("fullResolution: %s diagonal: %f filter: %s filename: %s "
@@ -94,145 +191,80 @@ std::string VisibleSurface::ToString() const {
                         set, p, n, ns, dzdx, dzdy, time, albedo);
 }
 
-// Sensor Method Definitions
-Sensor *Sensor::Create(const std::string &name, const RGBColorSpace *colorSpace,
-                       Float exposureTime, Float fNumber, Float ISO, Float C,
-                       Float whiteBalanceTemp, const FileLoc *loc, Allocator alloc) {
-    if (name == "cie1931") {
-        return alloc.new_object<Sensor>(colorSpace, whiteBalanceTemp, exposureTime,
-                                        fNumber, ISO, C, alloc);
+// PixelSensor Method Definitions
+PixelSensor *PixelSensor::Create(const ParameterDictionary &parameters,
+                                 const RGBColorSpace *colorSpace, Float exposureTime,
+                                 const FileLoc *loc, Allocator alloc) {
+    // Imaging ratio parameters
+    // The defaults here represent a "passthrough" setup such that the imaging
+    // ratio will be exactly 1. This is a useful default since scenes that
+    // weren't authored with a physical camera in mind will render as expected.
+    Float fNumber = parameters.GetOneFloat("fnumber", 1.);
+    Float ISO = parameters.GetOneFloat("iso", 100.);
+    // Note: in the talk we mention using 312.5 for historical reasons. The
+    // choice of 100 * Pi here just means that the other parameters make nice
+    // "round" numbers like 1 and 100.
+    Float C = parameters.GetOneFloat("c", 100.0 * Pi);
+    Float whiteBalanceTemp = parameters.GetOneFloat("whitebalance", 0);
+
+    std::string sensorName = parameters.GetOneString("sensor", "cie1931");
+
+    // Pass through 0 for cie1931 if it's unspecified so that it doesn't do
+    // any white balancing. For actual sensors, 6500 is the default...
+    if (sensorName != "cie1931" && whiteBalanceTemp == 0)
+        whiteBalanceTemp = 6500;
+
+    Float imagingRatio = Pi * exposureTime * ISO * K_m / (C * fNumber * fNumber);
+
+    if (sensorName == "cie1931") {
+        return alloc.new_object<PixelSensor>(colorSpace, whiteBalanceTemp, imagingRatio,
+                                             alloc);
     } else {
-        SpectrumHandle r = GetNamedSpectrum(name + "_r");
-        SpectrumHandle g = GetNamedSpectrum(name + "_g");
-        SpectrumHandle b = GetNamedSpectrum(name + "_b");
+        SpectrumHandle r = GetNamedSpectrum(sensorName + "_r");
+        SpectrumHandle g = GetNamedSpectrum(sensorName + "_g");
+        SpectrumHandle b = GetNamedSpectrum(sensorName + "_b");
 
         if (!r || !g || !b)
-            ErrorExit(loc, "%s: unknown sensor type", name);
+            ErrorExit(loc, "%s: unknown sensor type", sensorName);
 
-        return alloc.new_object<Sensor>(r, g, b, colorSpace, whiteBalanceTemp,
-                                        exposureTime, fNumber, ISO, C, alloc);
+        return alloc.new_object<PixelSensor>(r, g, b, colorSpace, whiteBalanceTemp,
+                                             imagingRatio, alloc);
     }
 }
 
-Sensor *Sensor::CreateDefault(Allocator alloc) {
-    return Create("cie1931", RGBColorSpace::sRGB, 1.0, 1.0, 100, 100.0 * Pi, 0.f, nullptr,
-                  alloc);
+PixelSensor *PixelSensor::CreateDefault(Allocator alloc) {
+    return Create(ParameterDictionary(), RGBColorSpace::sRGB, 1.0, nullptr, alloc);
 }
 
-Sensor::Sensor(const RGBColorSpace *outputColorSpace, Float whiteBalanceTemp,
-               Float exposureTime, Float fNumber, Float ISO, Float C, Allocator alloc)
-    : r_bar(&Spectra::X(), alloc),
-      g_bar(&Spectra::Y(), alloc),
-      b_bar(&Spectra::Z(), alloc),
-      exposureTime(exposureTime),
-      fNumber(fNumber),
-      ISO(ISO),
-      C(C) {
-    if (whiteBalanceTemp != 0) {
-        Point2f targetWhite = outputColorSpace->w;
-        auto whiteIlluminant = Spectra::D(whiteBalanceTemp, alloc);
-        Point2f sourceWhite = SpectrumToXYZ(&whiteIlluminant).xy();
-        XYZFromCameraRGB = WhiteBalance(sourceWhite, targetWhite);
-    }
-}
-
-Sensor::Sensor(SpectrumHandle r_bar, SpectrumHandle g_bar, SpectrumHandle b_bar,
-               const RGBColorSpace *outputColorSpace, Float whiteBalanceTemp,
-               Float exposureTime, Float fNumber, Float ISO, Float C, Allocator alloc)
-    : r_bar(r_bar, alloc),
-      g_bar(g_bar, alloc),
-      b_bar(b_bar, alloc),
-      exposureTime(exposureTime),
-      fNumber(fNumber),
-      ISO(ISO),
-      C(C) {
-    // Compute XYZ from camera RGB matrix
-    DenselySampledSpectrum sensorWhiteIlluminant = Spectra::D(whiteBalanceTemp, alloc);
-    pstd::optional<SquareMatrix<3>> m =
-        SolveCameraMatrix(sensorWhiteIlluminant, outputColorSpace->illuminant);
-    if (!m)
-        ErrorExit("Camera matrix could not be solved");
-    XYZFromCameraRGB = *m;
-
-    // Compute sensor's RGB normalization factor
-    // Compute white normalization factor for sensor
-    RGB white;
-    for (Float l = Lambda_min; l <= Lambda_max; ++l) {
-        white.r += r_bar(l) * outputColorSpace->illuminant(l);
-        white.g += g_bar(l) * outputColorSpace->illuminant(l);
-        white.b += b_bar(l) * outputColorSpace->illuminant(l);
-    }
-    white /= white.g;
-
-    cameraRGBWhiteNorm = RGB(1, 1, 1) / white;
-}
-
-RGB Sensor::SpectrumToCameraRGB(SpectrumHandle s, const DenselySampledSpectrum &illum,
-                                const DenselySampledSpectrum &r,
-                                const DenselySampledSpectrum &g,
-                                const DenselySampledSpectrum &b) {
-    RGB rgb(0, 0, 0);
-    Float g_integral = 0;
-    for (Float lambda = Lambda_min; lambda <= Lambda_max; ++lambda) {
-        g_integral += g(lambda) * illum(lambda);
-        rgb.r += r(lambda) * s(lambda) * illum(lambda);
-        rgb.g += g(lambda) * s(lambda) * illum(lambda);
-        rgb.b += b(lambda) * s(lambda) * illum(lambda);
-    }
-    return rgb / g_integral;
-}
-
-RGB Sensor::IlluminantToCameraRGB(const DenselySampledSpectrum &illum,
-                                  const DenselySampledSpectrum &r,
-                                  const DenselySampledSpectrum &g,
-                                  const DenselySampledSpectrum &b) {
-    RGB rgb(0, 0, 0);
-    for (Float lambda = Lambda_min; lambda <= Lambda_max; ++lambda) {
-        rgb.r += r(lambda) * illum(lambda);
-        rgb.g += g(lambda) * illum(lambda);
-        rgb.b += b(lambda) * illum(lambda);
-    }
-    return rgb / rgb.g;
-}
-
-Float Sensor::IlluminantToY(const DenselySampledSpectrum &illum,
-                            const DenselySampledSpectrum &g) {
-    Float y = 0;
-    for (Float lambda = Lambda_min; lambda <= Lambda_max; ++lambda)
-        y += g(lambda) * illum(lambda);
-    return y;
-}
-
-pstd::optional<SquareMatrix<3>> Sensor::SolveCameraMatrix(
-    const DenselySampledSpectrum &srcw, const DenselySampledSpectrum &dstw) const {
-    // FIXME: make sure these match trainingSwatches.size()
-    Float A_data[24][3];
-    Float B_data[24][3];
-
-    RGB src_white = IlluminantToCameraRGB(srcw, r_bar, g_bar, b_bar);
-    RGB dst_white = IlluminantToCameraRGB(dstw, r_bar, g_bar, b_bar);
-
-    // account for perceptual brightness difference in whites by scaling the
-    // target swatches by the relative difference between the whitepoint in
-    // camera space and in CIE XYZ
-    Float srcG = IlluminantToY(srcw, g_bar);
-    Float srcY = IlluminantToY(srcw, Spectra::Y());
-
-    for (size_t i = 0; i < trainingSwatches.size(); ++i) {
-        SpectrumHandle s = trainingSwatches[i];
-        RGB a = SpectrumToCameraRGB(s, srcw, r_bar, g_bar, b_bar) / dst_white;
-        RGB b = SpectrumToCameraRGB(s, dstw, Spectra::X(), Spectra::Y(), Spectra::Z()) *
-                (srcY / srcG);
-        for (int c = 0; c < 3; ++c) {
-            A_data[i][c] = a[c];
-            B_data[i][c] = b[c];
-        }
+pstd::optional<SquareMatrix<3>> PixelSensor::SolveXYZFromSensorRGB(
+    SpectrumHandle sensorIllum, SpectrumHandle outputIllum) const {
+    Float rgbCamera[24][3], xyzOutput[24][3];
+    // Compute _rgbCamera_ values for training swatches
+    RGB outputWhite = IlluminantToSensorRGB(outputIllum);
+    for (size_t i = 0; i < swatchReflectances.size(); ++i) {
+        RGB rgb = ProjectReflectance<RGB>(swatchReflectances[i], sensorIllum, &r_bar,
+                                          &g_bar, &b_bar) /
+                  outputWhite;
+        for (int c = 0; c < 3; ++c)
+            rgbCamera[i][c] = rgb[c];
     }
 
-    return LinearLeastSquares(A_data, B_data, trainingSwatches.size());
+    // Compute _xyzOutput_ values for training swatches
+    Float sensorWhiteG = InnerProduct(sensorIllum, &g_bar);
+    Float sensorWhiteY = InnerProduct(sensorIllum, &Spectra::Y());
+    for (size_t i = 0; i < swatchReflectances.size(); ++i) {
+        SpectrumHandle s = swatchReflectances[i];
+        XYZ xyz = ProjectReflectance<XYZ>(s, outputIllum, &Spectra::X(), &Spectra::Y(),
+                                          &Spectra::Z()) *
+                  (sensorWhiteY / sensorWhiteG);
+        for (int c = 0; c < 3; ++c)
+            xyzOutput[i][c] = xyz[c];
+    }
+
+    return LinearLeastSquares(rgbCamera, xyzOutput, swatchReflectances.size());
 }
 
-std::vector<SpectrumHandle> Sensor::trainingSwatches{
+std::vector<SpectrumHandle> PixelSensor::swatchReflectances{
     PiecewiseLinearSpectrum::FromInterleaved(
         {380.000000, 0.051500, 390.000000, 0.056500, 400.000000, 0.063000,
          410.000000, 0.065000, 420.000000, 0.063000, 430.000000, 0.060500,
@@ -573,14 +605,10 @@ std::vector<SpectrumHandle> Sensor::trainingSwatches{
 STAT_MEMORY_COUNTER("Memory/Film pixels", filmPixelMemory);
 
 // RGBFilm Method Definitions
-RGBFilm::RGBFilm(const Sensor *sensor, const Point2i &resolution,
-                 const Bounds2i &pixelBounds, FilterHandle filter, Float diagonal,
-                 const std::string &filename, Float scale,
-                 const RGBColorSpace *colorSpace, Float maxComponentValue, bool writeFP16,
-                 Allocator allocator)
-    : FilmBase(resolution, pixelBounds, filter, diagonal, sensor, filename),
-      pixels(pixelBounds, allocator),
-      scale(scale),
+RGBFilm::RGBFilm(FilmBaseParameters p, const RGBColorSpace *colorSpace,
+                 Float maxComponentValue, bool writeFP16, Allocator alloc)
+    : FilmBase(p),
+      pixels(p.pixelBounds, alloc),
       colorSpace(colorSpace),
       maxComponentValue(maxComponentValue),
       writeFP16(writeFP16) {
@@ -588,28 +616,32 @@ RGBFilm::RGBFilm(const Sensor *sensor, const Point2i &resolution,
     CHECK(!pixelBounds.IsEmpty());
     CHECK(colorSpace != nullptr);
     filmPixelMemory += pixelBounds.Area() * sizeof(Pixel);
-    outputRGBFromCameraRGB = colorSpace->RGBFromXYZ * sensor->XYZFromCameraRGB;
+    outputRGBFromSensorRGB = colorSpace->RGBFromXYZ * sensor->XYZFromSensorRGB;
 }
 
 SampledWavelengths RGBFilm::SampleWavelengths(Float u) const {
     return SampledWavelengths::SampleXYZ(u);
 }
 
-void RGBFilm::AddSplat(const Point2f &p, SampledSpectrum v,
+void RGBFilm::AddSplat(const Point2f &p, SampledSpectrum L,
                        const SampledWavelengths &lambda) {
-    CHECK(!v.HasNaNs());
-    // First convert to sensor exposure, H, then to camera RGB
-    SampledSpectrum H = v * sensor->ImagingRatio();
-    RGB rgb = sensor->ToCameraRGB(H, lambda);
-    // Optionally clamp splat sensor RGB value
+    CHECK(!L.HasNaNs());
+    // Convert sample radiance to _PixelSensor_ RGB
+    SampledSpectrum H = L * sensor->ImagingRatio();
+    RGB rgb = sensor->ToSensorRGB(H, lambda);
+
+    // Optionally clamp sensor RGB value
     Float m = std::max({rgb.r, rgb.g, rgb.b});
-    if (m > maxComponentValue)
+    if (m > maxComponentValue) {
+        H *= maxComponentValue / m;
         rgb *= maxComponentValue / m;
+    }
 
     // Compute bounds of affected pixels for splat, _splatBounds_
     Point2f pDiscrete = p + Vector2f(0.5, 0.5);
-    Bounds2i splatBounds(Point2i(Floor(pDiscrete - filter.Radius())),
-                         Point2i(Floor(pDiscrete + filter.Radius())) + Vector2i(1, 1));
+    Vector2f radius = filter.Radius();
+    Bounds2i splatBounds(Point2i(Floor(pDiscrete - radius)),
+                         Point2i(Floor(pDiscrete + radius)) + Vector2i(1, 1));
     splatBounds = Intersect(splatBounds, pixelBounds);
 
     for (Point2i pi : splatBounds) {
@@ -646,142 +678,27 @@ Image RGBFilm::GetImage(ImageMetadata *metadata, Float splatScale) {
     metadata->fullResolution = fullResolution;
     metadata->colorSpace = colorSpace;
 
-    Float varianceSum = 0;
-    for (Point2i p : pixelBounds) {
-        const Pixel &pixel = pixels[p];
-        varianceSum += Float(pixel.varianceEstimator.Variance());
-    }
-    metadata->estimatedVariance = varianceSum / pixelBounds.Area();
-
     return image;
 }
 
 std::string RGBFilm::ToString() const {
-    return StringPrintf("[ RGBFilm %s scale: %f colorSpace: %s maxComponentValue: %f "
-                        "writeFP16: %s ]",
-                        BaseToString(), scale, *colorSpace, maxComponentValue, writeFP16);
+    return StringPrintf(
+        "[ RGBFilm %s colorSpace: %s maxComponentValue: %f writeFP16: %s ]",
+        BaseToString(), *colorSpace, maxComponentValue, writeFP16);
 }
 
 RGBFilm *RGBFilm::Create(const ParameterDictionary &parameters, Float exposureTime,
                          FilterHandle filter, const RGBColorSpace *colorSpace,
                          const FileLoc *loc, Allocator alloc) {
-    std::string filename = parameters.GetOneString("filename", "");
-    if (!Options->imageFile.empty()) {
-        if (!filename.empty())
-            Warning(loc,
-                    "Output filename supplied on command line, \"%s\" will "
-                    "override "
-                    "filename provided in scene description file, \"%s\".",
-                    Options->imageFile, filename);
-        filename = Options->imageFile;
-    } else if (filename.empty())
-        filename = "pbrt.exr";
-
-    Point2i fullResolution(parameters.GetOneInt("xresolution", 1280),
-                           parameters.GetOneInt("yresolution", 720));
-    if (Options->quickRender) {
-        fullResolution.x = std::max(1, fullResolution.x / 4);
-        fullResolution.y = std::max(1, fullResolution.y / 4);
-    }
-
-    Bounds2i pixelBounds(Point2i(0, 0), fullResolution);
-    std::vector<int> pb = parameters.GetIntArray("pixelbounds");
-    if (Options->pixelBounds) {
-        Bounds2i newBounds = *Options->pixelBounds;
-        if (Intersect(newBounds, pixelBounds) != newBounds)
-            Warning(loc, "Supplied pixel bounds extend beyond image "
-                         "resolution. Clamping.");
-        pixelBounds = Intersect(newBounds, pixelBounds);
-
-        if (!pb.empty())
-            Warning(loc, "Both pixel bounds and crop window were specified. Using the "
-                         "crop window.");
-    } else if (!pb.empty()) {
-        if (pb.size() != 4)
-            Error(loc, "%d values supplied for \"pixelbounds\". Expected 4.",
-                  int(pb.size()));
-        else {
-            Bounds2i newBounds = Bounds2i({pb[0], pb[2]}, {pb[1], pb[3]});
-            if (Intersect(newBounds, pixelBounds) != newBounds)
-                Warning(loc, "Supplied pixel bounds extend beyond image "
-                             "resolution. Clamping.");
-            pixelBounds = Intersect(newBounds, pixelBounds);
-        }
-    }
-
-    std::vector<Float> cr = parameters.GetFloatArray("cropwindow");
-    if (Options->cropWindow) {
-        Bounds2f crop = *Options->cropWindow;
-        // Compute film image bounds
-        pixelBounds = Bounds2i(Point2i(std::ceil(fullResolution.x * crop.pMin.x),
-                                       std::ceil(fullResolution.y * crop.pMin.y)),
-                               Point2i(std::ceil(fullResolution.x * crop.pMax.x),
-                                       std::ceil(fullResolution.y * crop.pMax.y)));
-
-        if (!cr.empty())
-            Warning(loc, "Crop window supplied on command line will override "
-                         "crop window specified with Film.");
-        if (Options->pixelBounds || !pb.empty())
-            Warning(loc, "Both pixel bounds and crop window were specified. Using the "
-                         "crop window.");
-    } else if (!cr.empty()) {
-        if (Options->pixelBounds)
-            Warning(loc, "Ignoring \"cropwindow\" since pixel bounds were specified "
-                         "on the command line.");
-        else if (cr.size() == 4) {
-            if (!pb.empty())
-                Warning(loc, "Both pixel bounds and crop window were "
-                             "specified. Using the "
-                             "crop window.");
-
-            Bounds2f crop;
-            crop.pMin.x = Clamp(std::min(cr[0], cr[1]), 0.f, 1.f);
-            crop.pMax.x = Clamp(std::max(cr[0], cr[1]), 0.f, 1.f);
-            crop.pMin.y = Clamp(std::min(cr[2], cr[3]), 0.f, 1.f);
-            crop.pMax.y = Clamp(std::max(cr[2], cr[3]), 0.f, 1.f);
-
-            // Compute film image bounds
-            pixelBounds = Bounds2i(Point2i(std::ceil(fullResolution.x * crop.pMin.x),
-                                           std::ceil(fullResolution.y * crop.pMin.y)),
-                                   Point2i(std::ceil(fullResolution.x * crop.pMax.x),
-                                           std::ceil(fullResolution.y * crop.pMax.y)));
-        } else
-            Error(loc, "%d values supplied for \"cropwindow\". Expected 4.",
-                  (int)cr.size());
-    }
-
-    if (pixelBounds.IsEmpty())
-        ErrorExit(loc, "Degenerate pixel bounds provided to film: %s.", pixelBounds);
-
-    Float scale = parameters.GetOneFloat("scale", 1.);
-    Float diagonal = parameters.GetOneFloat("diagonal", 35.);
     Float maxComponentValue = parameters.GetOneFloat("maxcomponentvalue", Infinity);
     bool writeFP16 = parameters.GetOneBool("savefp16", true);
 
-    // Imaging ratio parameters
-    // The defaults here represent a "passthrough" setup such that the imaging
-    // ratio will be exactly 1. This is a useful default since scenes that
-    // weren't authored with a physical camera in mind will render as expected.
-    Float fNumber = parameters.GetOneFloat("fnumber", 1.);
-    Float ISO = parameters.GetOneFloat("iso", 100.);
-    // Note: in the talk we mention using 312.5 for historical reasons. The
-    // choice of 100 * Pi here just means that the other parameters make nice
-    // "round" numbers like 1 and 100.
-    Float C = parameters.GetOneFloat("c", 100.0 * Pi);
-    Float whiteBalanceTemp = parameters.GetOneFloat("whitebalance", 0);
+    PixelSensor *sensor =
+        PixelSensor::Create(parameters, colorSpace, exposureTime, loc, alloc);
+    FilmBaseParameters filmBaseParameters(parameters, filter, sensor, loc);
 
-    std::string sensorName = parameters.GetOneString("sensor", "cie1931");
-    // Pass through 0 for cie1931 if it's unspecified so that it doesn't do
-    // any white balancing. For actual sensors, 6500 is the default...
-    if (sensorName != "cie1931" && whiteBalanceTemp == 0)
-        whiteBalanceTemp = 6500;
-
-    Sensor *sensor = Sensor::Create(sensorName, colorSpace, exposureTime, fNumber, ISO, C,
-                                    whiteBalanceTemp, loc, alloc);
-
-    return alloc.new_object<RGBFilm>(sensor, fullResolution, pixelBounds, filter,
-                                     diagonal, filename, scale, colorSpace,
-                                     maxComponentValue, writeFP16, alloc);
+    return alloc.new_object<RGBFilm>(filmBaseParameters, colorSpace, maxComponentValue,
+                                     writeFP16, alloc);
 }
 
 // GBufferFilm Method Definitions
@@ -790,7 +707,7 @@ void GBufferFilm::AddSample(const Point2i &pFilm, SampledSpectrum L,
                             const VisibleSurface *visibleSurface, Float weight) {
     // First convert to sensor exposure, H, then to camera RGB
     SampledSpectrum H = L * sensor->ImagingRatio();
-    RGB rgb = sensor->ToCameraRGB(H, lambda);
+    RGB rgb = sensor->ToSensorRGB(H, lambda);
     Float m = std::max({rgb.r, rgb.g, rgb.b});
     if (m > maxComponentValue) {
         H *= maxComponentValue / m;
@@ -800,8 +717,8 @@ void GBufferFilm::AddSample(const Point2i &pFilm, SampledSpectrum L,
     Pixel &p = pixels[pFilm];
     if (visibleSurface && *visibleSurface) {
         // Update variance estimates.
-        // TODO: store channels independently?
-        p.rgbVarianceEstimator.Add(H.y(lambda));
+        for (int c = 0; c < 3; ++c)
+            p.varianceEstimator[c].Add(rgb[c]);
 
         p.pSum += weight * visibleSurface->p;
 
@@ -823,21 +740,17 @@ void GBufferFilm::AddSample(const Point2i &pFilm, SampledSpectrum L,
     p.weightSum += weight;
 }
 
-GBufferFilm::GBufferFilm(const Sensor *sensor, const Point2i &resolution,
-                         const Bounds2i &pixelBounds, FilterHandle filter, Float diagonal,
-                         const std::string &filename, Float scale,
-                         const RGBColorSpace *colorSpace, Float maxComponentValue,
-                         bool writeFP16, Allocator alloc)
-    : FilmBase(resolution, pixelBounds, filter, diagonal, sensor, filename),
+GBufferFilm::GBufferFilm(FilmBaseParameters p, const RGBColorSpace *colorSpace,
+                         Float maxComponentValue, bool writeFP16, Allocator alloc)
+    : FilmBase(p),
       pixels(pixelBounds, alloc),
-      scale(scale),
       colorSpace(colorSpace),
       maxComponentValue(maxComponentValue),
       writeFP16(writeFP16),
       filterIntegral(filter.Integral()) {
     CHECK(!pixelBounds.IsEmpty());
     filmPixelMemory += pixelBounds.Area() * sizeof(Pixel);
-    outputRGBFromCameraRGB = colorSpace->RGBFromXYZ * sensor->XYZFromCameraRGB;
+    outputRGBFromSensorRGB = colorSpace->RGBFromXYZ * sensor->XYZFromSensorRGB;
 }
 
 SampledWavelengths GBufferFilm::SampleWavelengths(Float u) const {
@@ -850,7 +763,7 @@ void GBufferFilm::AddSplat(const Point2f &p, SampledSpectrum v,
     CHECK(!v.HasNaNs());
     // First convert to sensor exposure, H, then to camera RGB
     SampledSpectrum H = v * sensor->ImagingRatio();
-    RGB rgb = sensor->ToCameraRGB(H, lambda);
+    RGB rgb = sensor->ToSensorRGB(H, lambda);
     Float m = std::max({rgb.r, rgb.g, rgb.b});
     if (m > maxComponentValue)
         rgb *= maxComponentValue / m;
@@ -897,11 +810,12 @@ Image GBufferFilm::GetImage(ImageMetadata *metadata, Float splatScale) {
                  "Nsx",
                  "Nsy",
                  "Nsz",
-                 "materialId.R",
-                 "materialId.G",
-                 "materialId.B",
-                 "rgbVariance",
-                 "rgbRelativeVariance"});
+                 "Variance.R",
+                 "Variance.G",
+                 "Variance.B",
+                 "RelativeVariance.R",
+                 "RelativeVariance.G",
+                 "RelativeVariance.B"});
 
     ImageChannelDesc rgbDesc = image.GetChannelDesc({"R", "G", "B"});
     ImageChannelDesc pDesc = image.GetChannelDesc({"Px", "Py", "Pz"});
@@ -911,7 +825,9 @@ Image GBufferFilm::GetImage(ImageMetadata *metadata, Float splatScale) {
     ImageChannelDesc albedoRgbDesc =
         image.GetChannelDesc({"Albedo.R", "Albedo.G", "Albedo.B"});
     ImageChannelDesc varianceDesc =
-        image.GetChannelDesc({"rgbVariance", "rgbRelativeVariance"});
+        image.GetChannelDesc({"Variance.R", "Variance.G", "Variance.B"});
+    ImageChannelDesc relVarianceDesc = image.GetChannelDesc(
+        {"RelativeVariance.R", "RelativeVariance.G", "RelativeVariance.B"});
 
     ParallelFor2D(pixelBounds, [&](Point2i p) {
         Pixel &pixel = pixels[p];
@@ -934,7 +850,7 @@ Image GBufferFilm::GetImage(ImageMetadata *metadata, Float splatScale) {
         for (int c = 0; c < 3; ++c)
             rgb[c] += splatScale * pixel.splatRGB[c] / filterIntegral;
 
-        rgb *= scale;
+        rgb = outputRGBFromSensorRGB * rgb;
 
         Point2i pOffset(p.x - pixelBounds.pMin.x, p.y - pixelBounds.pMin.y);
         image.SetChannels(pOffset, rgbDesc, {rgb[0], rgb[1], rgb[2]});
@@ -949,21 +865,19 @@ Image GBufferFilm::GetImage(ImageMetadata *metadata, Float splatScale) {
         image.SetChannels(pOffset, dzDesc, {std::abs(dzdx), std::abs(dzdy)});
         image.SetChannels(pOffset, nDesc, {n.x, n.y, n.z});
         image.SetChannels(pOffset, nsDesc, {ns.x, ns.y, ns.z});
-        image.SetChannels(pOffset, varianceDesc,
-                          {pixel.rgbVarianceEstimator.Variance(),
-                           pixel.rgbVarianceEstimator.RelativeVariance()});
+        image.SetChannels(
+            pOffset, varianceDesc,
+            {pixel.varianceEstimator[0].Variance(), pixel.varianceEstimator[1].Variance(),
+             pixel.varianceEstimator[2].Variance()});
+        image.SetChannels(pOffset, relVarianceDesc,
+                          {pixel.varianceEstimator[0].RelativeVariance(),
+                           pixel.varianceEstimator[1].RelativeVariance(),
+                           pixel.varianceEstimator[2].RelativeVariance()});
     });
 
     metadata->pixelBounds = pixelBounds;
     metadata->fullResolution = fullResolution;
     metadata->colorSpace = colorSpace;
-
-    Float varianceSum = 0;
-    for (Point2i p : pixelBounds) {
-        const Pixel &pixel = pixels[p];
-        varianceSum += pixel.rgbVarianceEstimator.Variance();
-    }
-    metadata->estimatedVariance = varianceSum / pixelBounds.Area();
 
     return image;
 }
@@ -978,122 +892,19 @@ GBufferFilm *GBufferFilm::Create(const ParameterDictionary &parameters,
                                  Float exposureTime, FilterHandle filter,
                                  const RGBColorSpace *colorSpace, const FileLoc *loc,
                                  Allocator alloc) {
-    std::string filename = parameters.GetOneString("filename", "");
-    if (!Options->imageFile.empty()) {
-        if (!filename.empty())
-            Warning(loc,
-                    "Output filename supplied on command line, \"%s\" will "
-                    "override "
-                    "filename provided in scene description file, \"%s\".",
-                    Options->imageFile, filename);
-        filename = Options->imageFile;
-    } else if (filename.empty())
-        filename = "pbrt.exr";
-
-    Point2i fullResolution(parameters.GetOneInt("xresolution", 1280),
-                           parameters.GetOneInt("yresolution", 720));
-    if (Options->quickRender) {
-        fullResolution.x = std::max(1, fullResolution.x / 4);
-        fullResolution.y = std::max(1, fullResolution.y / 4);
-    }
-
-    Bounds2i pixelBounds(Point2i(0, 0), fullResolution);
-    std::vector<int> pb = parameters.GetIntArray("pixelbounds");
-    if (Options->pixelBounds) {
-        Bounds2i newBounds = *Options->pixelBounds;
-        if (Intersect(newBounds, pixelBounds) != newBounds)
-            Warning(loc, "Supplied pixel bounds extend beyond image "
-                         "resolution. Clamping.");
-        pixelBounds = Intersect(newBounds, pixelBounds);
-
-        if (!pb.empty())
-            Warning(loc, "Both pixel bounds and crop window were specified. Using the "
-                         "crop window.");
-    } else if (!pb.empty()) {
-        if (pb.size() != 4)
-            Error(loc, "%d values supplied for \"pixelbounds\". Expected 4.",
-                  int(pb.size()));
-        else {
-            Bounds2i newBounds = Bounds2i({pb[0], pb[2]}, {pb[1], pb[3]});
-            if (Intersect(newBounds, pixelBounds) != newBounds)
-                Warning(loc, "Supplied pixel bounds extend beyond image "
-                             "resolution. Clamping.");
-            pixelBounds = Intersect(newBounds, pixelBounds);
-        }
-    }
-
-    std::vector<Float> cr = parameters.GetFloatArray("cropwindow");
-    if (Options->cropWindow) {
-        Bounds2f crop = *Options->cropWindow;
-        // Compute film image bounds
-        pixelBounds = Bounds2i(Point2i(std::ceil(fullResolution.x * crop.pMin.x),
-                                       std::ceil(fullResolution.y * crop.pMin.y)),
-                               Point2i(std::ceil(fullResolution.x * crop.pMax.x),
-                                       std::ceil(fullResolution.y * crop.pMax.y)));
-
-        if (!cr.empty())
-            Warning(loc, "Crop window supplied on command line will override "
-                         "crop window specified with Film.");
-        if (Options->pixelBounds || !pb.empty())
-            Warning(loc, "Both pixel bounds and crop window were specified. Using the "
-                         "crop window.");
-    } else if (!cr.empty()) {
-        if (Options->pixelBounds)
-            Warning(loc, "Ignoring \"cropwindow\" since pixel bounds were specified "
-                         "on the command line.");
-        else if (cr.size() == 4) {
-            if (!pb.empty())
-                Warning(loc, "Both pixel bounds and crop window were "
-                             "specified. Using the "
-                             "crop window.");
-
-            Bounds2f crop;
-            crop.pMin.x = Clamp(std::min(cr[0], cr[1]), 0.f, 1.f);
-            crop.pMax.x = Clamp(std::max(cr[0], cr[1]), 0.f, 1.f);
-            crop.pMin.y = Clamp(std::min(cr[2], cr[3]), 0.f, 1.f);
-            crop.pMax.y = Clamp(std::max(cr[2], cr[3]), 0.f, 1.f);
-
-            // Compute film image bounds
-            pixelBounds = Bounds2i(Point2i(std::ceil(fullResolution.x * crop.pMin.x),
-                                           std::ceil(fullResolution.y * crop.pMin.y)),
-                                   Point2i(std::ceil(fullResolution.x * crop.pMax.x),
-                                           std::ceil(fullResolution.y * crop.pMax.y)));
-        } else
-            Error(loc, "%d values supplied for \"cropwindow\". Expected 4.",
-                  (int)cr.size());
-    }
-
-    if (pixelBounds.IsEmpty())
-        ErrorExit(loc, "Degenerate pixel bounds provided to film: %s.", pixelBounds);
-
-    Float diagonal = parameters.GetOneFloat("diagonal", 35.);
     Float maxComponentValue = parameters.GetOneFloat("maxcomponentvalue", Infinity);
-    Float scale = parameters.GetOneFloat("scale", 1.);
     bool writeFP16 = parameters.GetOneBool("savefp16", true);
 
-    // Imaging ratio parameters
-    // The defaults here represent a "passthrough" setup such that the imaging
-    // ratio will be exactly 1. This is a useful default since scenes that
-    // weren't authored with a physical camera in mind will render as expected.
-    Float fNumber = parameters.GetOneFloat("fnumber", 1.);
-    Float ISO = parameters.GetOneFloat("iso", 100.);
-    // Note: in the talk we mention using 312.5 for historical reasons. The
-    // choice of 100 * Pi here just means that the other parameters make nice
-    // "round" numbers like 1 and 100.
-    Float C = parameters.GetOneFloat("c", 100.0 * Pi);
-    Float whiteBalanceTemp = parameters.GetOneFloat("whitebalance", 0);
+    PixelSensor *sensor =
+        PixelSensor::Create(parameters, colorSpace, exposureTime, loc, alloc);
 
-    std::string sensorName = parameters.GetOneString("sensor", "cie1931");
-    // Pass through 0 for cie1931 if it's unspecified so that it doesn't do
-    // any white balancing. For actual sensors, 6500 is the default...
-    if (sensorName != "cie1931" && whiteBalanceTemp == 0)
-        whiteBalanceTemp = 6500;
+    FilmBaseParameters filmBaseParameters(parameters, filter, sensor, loc);
 
-    Sensor *sensor = Sensor::Create(sensorName, colorSpace, exposureTime, fNumber, ISO, C,
-                                    whiteBalanceTemp, loc, alloc);
+    if (!HasExtension(filmBaseParameters.filename, "exr"))
+        ErrorExit(loc, "%s: EXR is the only format supported by the GBufferFilm.",
+                  filmBaseParameters.filename);
 
-    return alloc.new_object<GBufferFilm>(sensor, fullResolution, pixelBounds, filter,
-                                         diagonal, filename, scale, colorSpace,
+    return alloc.new_object<GBufferFilm>(filmBaseParameters, colorSpace,
                                          maxComponentValue, writeFP16, alloc);
 }
 

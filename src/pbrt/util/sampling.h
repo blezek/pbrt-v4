@@ -37,12 +37,14 @@ Point2f InvertSphericalTriangleSample(const pstd::array<Point3f, 3> &v, const Po
                                       const Vector3f &w);
 
 PBRT_CPU_GPU
-Point3f SampleSphericalQuad(const Point3f &p, const Point3f &v00, const Vector3f &ex,
-                            const Vector3f &ey, const Point2f &u, Float *pdf = nullptr);
+Point3f SampleSphericalRectangle(const Point3f &p, const Point3f &v00, const Vector3f &ex,
+                                 const Vector3f &ey, const Point2f &u,
+                                 Float *pdf = nullptr);
+
 PBRT_CPU_GPU
-Point2f InvertSphericalQuadSample(const Point3f &pRef, const Point3f &v00,
-                                  const Vector3f &ex, const Vector3f &ey,
-                                  const Point3f &pQuad);
+Point2f InvertSphericalRectangleSample(const Point3f &pRef, const Point3f &v00,
+                                       const Vector3f &ex, const Vector3f &ey,
+                                       const Point3f &pQuad);
 
 PBRT_CPU_GPU
 Vector3f SampleHenyeyGreenstein(const Vector3f &wo, Float g, const Point2f &u,
@@ -393,14 +395,15 @@ inline Float SampleXYZMatching(Float u) {
     return 538 - 138.888889f * std::atanh(0.85691062f - 1.82750197f * u);
 }
 
-PBRT_CPU_GPU
-inline pstd::array<Float, 3> SampleUniformTriangle(const Point2f &u) {
-    Float b0 = u[0] / 2, b1 = u[1] / 2;
-    Float offset = b1 - b0;
-    if (offset > 0)
-        b1 += offset;
-    else
-        b0 -= offset;
+PBRT_CPU_GPU inline pstd::array<Float, 3> SampleUniformTriangle(const Point2f &u) {
+    Float b0, b1;
+    if (u[0] < u[1]) {
+        b0 = u[0] / 2;
+        b1 = u[1] - b0;
+    } else {
+        b1 = u[1] / 2;
+        b0 = u[0] - b1;
+    }
     return {b0, b1, 1 - b0 - b1};
 }
 

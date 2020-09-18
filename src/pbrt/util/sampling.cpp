@@ -37,8 +37,10 @@ Point2f RejectionSampleDisk(RNG &rng) {
 pstd::array<Float, 3> SampleSphericalTriangle(const pstd::array<Point3f, 3> &v,
                                               const Point3f &p, const Point2f &u,
                                               Float *pdf) {
-    using Vector3d = Vector3<Float>;
-    Vector3d a(v[0] - p), b(v[1] - p), c(v[2] - p);
+    if (pdf != nullptr)
+        *pdf = 0;
+    // Compute vectors _a_, _b_, and _c_ to spherical triangle vertices
+    Vector3f a(v[0] - p), b(v[1] - p), c(v[2] - p);
     CHECK_GT(LengthSquared(a), 0);
     CHECK_GT(LengthSquared(b), 0);
     CHECK_GT(LengthSquared(c), 0);
@@ -46,54 +48,37 @@ pstd::array<Float, 3> SampleSphericalTriangle(const pstd::array<Point3f, 3> &v,
     b = Normalize(b);
     c = Normalize(c);
 
-    // TODO: have a shared snippet that goes from here to computing
-    // alpha/beta/gamma, use it also in Triangle::SolidAngle().
-    Vector3d axb = Cross(a, b), bxc = Cross(b, c), cxa = Cross(c, a);
-    if (LengthSquared(axb) == 0 || LengthSquared(bxc) == 0 || LengthSquared(cxa) == 0) {
-        if (pdf != nullptr)
-            *pdf = 0;
+    // Compute normalized cross products of all direction pairs
+    Vector3f n_ab = Cross(a, b), n_bc = Cross(b, c), n_ca = Cross(c, a);
+    if (LengthSquared(n_ab) == 0 || LengthSquared(n_bc) == 0 || LengthSquared(n_ca) == 0)
         return {};
-    }
-    axb = Normalize(axb);
-    bxc = Normalize(bxc);
-    cxa = Normalize(cxa);
+    n_ab = Normalize(n_ab);
+    n_bc = Normalize(n_bc);
+    n_ca = Normalize(n_ca);
 
-    // See comment in Triangle::SolidAngle() for ordering...
-    Float alpha = AngleBetween(cxa, -axb);
-    Float beta = AngleBetween(axb, -bxc);
-    Float gamma = AngleBetween(bxc, -cxa);
+    // Compute angles $\alpha$, $\beta$, and $\gamma$ at spherical triangle vertices
+    Float alpha = AngleBetween(n_ab, -n_ca);
+    Float beta = AngleBetween(n_bc, -n_ab);
+    Float gamma = AngleBetween(n_ca, -n_bc);
 
-    // Spherical area of the triangle.
+    // Uniformly sample triangle area $A$ to compute $A'$
     Float A = alpha + beta + gamma - Pi;
-    if (A <= 0) {
-        if (pdf != nullptr)
-            *pdf = 0;
+    if (A <= 0)
         return {};
-    }
     if (pdf != nullptr)
         *pdf = 1 / A;
-
-    // Uniformly sample triangle area
     Float Ap = u[0] * A;
 
-    // Compute sin beta' and cos beta' for the point along the edge b
-    // corresponding to the area sampled, A'.
-
+    // Compute $\sin \beta'$ and $\cos \beta'$ for point along _b_ for sampled area
     Float cosAlpha = std::cos(alpha), sinAlpha = std::sin(alpha);
 
-    Float sinPhi = std::sin(Ap) * cosAlpha - std::cos(Ap) * SafeSqrt(1 - Sqr(cosAlpha));
-    Float cosPhi = std::cos(Ap) * cosAlpha + std::sin(Ap) * SafeSqrt(1 - Sqr(cosAlpha));
+    Float sinPhi = std::sin(Ap) * cosAlpha - std::cos(Ap) * sinAlpha;
+    Float cosPhi = std::cos(Ap) * cosAlpha + std::sin(Ap) * sinAlpha;
 
     Float uu = cosPhi - cosAlpha;
     Float vv = sinPhi + sinAlpha * Dot(a, b) /* cos c */;
     Float cosBetap = (((vv * cosPhi - uu * sinPhi) * cosAlpha - vv) /
                       ((vv * sinPhi + uu * cosPhi) * sinAlpha));
-#if 0
-    CHECK_RARE(1e-6, cosBetap < -1.001 || cosBetap > 1.001);
-    if (cosBetap < -1.001 || cosBetap > 1.001)
-        LOG_ERROR("cbp %f", cosBetap);
-#endif
-
     // Happens if the triangle basically covers the entire hemisphere.
     // We currently depend on calling code to detect this case, which
     // is sort of ugly/unfortunate.
@@ -101,51 +86,40 @@ pstd::array<Float, 3> SampleSphericalTriangle(const pstd::array<Point3f, 3> &v,
     cosBetap = Clamp(cosBetap, -1, 1);
     Float sinBetap = SafeSqrt(1 - cosBetap * cosBetap);
 
+    // Compute $c'$ along the arc between $b'$ and $a$
     // Gram-Schmidt
-    auto GS = [](const Vector3d &a, const Vector3d &b) {
+    auto GS = [](const Vector3f &a, const Vector3f &b) {
         return Normalize(a - Dot(a, b) * b);
     };
+    Vector3f cp = cosBetap * a + sinBetap * GS(c, a);
 
-    // Compute c', the point along the arc between b' and a.
-    Vector3d cp = cosBetap * a + sinBetap * GS(c, a);
-
+    // Compute sampled spherical triangle direction and return barycentrics
     Float cosTheta = 1 - u[1] * (1 - Dot(cp, b));
     Float sinTheta = SafeSqrt(1 - cosTheta * cosTheta);
-
-    // Compute direction on the sphere.
-    Vector3d w = cosTheta * b + sinTheta * GS(cp, b);
-
-    // Compute barycentrics. Subset of Moller-Trumbore intersection test.
-    Vector3d e1(v[1] - v[0]), e2(v[2] - v[0]);
-    Vector3d s1 = Cross(w, e2);
+    Vector3f w = cosTheta * b + sinTheta * GS(cp, b);
+    // Find barycentric coordinates for sampled direction _w_
+    Vector3f e1(v[1] - v[0]), e2(v[2] - v[0]);
+    Vector3f s1 = Cross(w, e2);
     Float divisor = Dot(s1, e1);
-
     CHECK_RARE(1e-6, divisor == 0);
     if (divisor == 0) {
         // This happens with triangles that cover (nearly) the whole
         // hemisphere.
-        // LOG_ERROR("Divisor 0. A = %f", A);
         return {1.f / 3.f, 1.f / 3.f, 1.f / 3.f};
     }
     Float invDivisor = 1 / divisor;
-
-    // Compute first barycentric coordinate
-    Vector3d s(p - v[0]);
+    Vector3f s(p - v[0]);
     Float b1 = Dot(s, s1) * invDivisor;
-
-    // Compute second barycentric coordinate
-    Vector3d s2 = Cross(s, e1);
+    Vector3f s2 = Cross(s, e1);
     Float b2 = Dot(w, s2) * invDivisor;
 
-    // We get goofy barycentrics for very small and very large (w.r.t. the
-    // sphere) triangles.
+    // Return clamped barycentrics for sampled direction
     b1 = Clamp(b1, 0, 1);
     b2 = Clamp(b2, 0, 1);
     if (b1 + b2 > 1) {
         b1 /= b1 + b2;
         b2 /= b1 + b2;
     }
-
     return {Float(1 - b1 - b2), Float(b1), Float(b2)};
 }
 
@@ -211,16 +185,13 @@ Point2f InvertSphericalTriangleSample(const pstd::array<Point3f, 3> &v, const Po
     return Point2f(Clamp(u0, 0, 1), Clamp(u1, 0, 1));
 }
 
-Point3f SampleSphericalQuad(const Point3f &pRef, const Point3f &s, const Vector3f &ex,
-                            const Vector3f &ey, const Point2f &u, Float *pdf) {
-    // SphQuadInit()
-    // local reference system 'R'
+Point3f SampleSphericalRectangle(const Point3f &pRef, const Point3f &s,
+                                 const Vector3f &ex, const Vector3f &ey, const Point2f &u,
+                                 Float *pdf) {
+    // Compute local reference frame and transform rectangle coordinates
     Float exl = Length(ex), eyl = Length(ey);
     Frame R = Frame::FromXY(ex / exl, ey / eyl);
-
-    // compute rectangle coords in local reference system
-    Vector3f d = s - pRef;
-    Vector3f dLocal = R.ToLocal(d);
+    Vector3f dLocal = R.ToLocal(s - pRef);
     Float z0 = dLocal.z;
 
     // flip 'z' to make it point against 'Q'
@@ -228,33 +199,20 @@ Point3f SampleSphericalQuad(const Point3f &pRef, const Point3f &s, const Vector3
         R.z = -R.z;
         z0 *= -1;
     }
-    Float z0sq = Sqr(z0);
-    Float x0 = dLocal.x;
-    Float y0 = dLocal.y;
-    Float x1 = x0 + exl;
-    Float y1 = y0 + eyl;
-    Float y0sq = Sqr(y0), y1sq = Sqr(y1);
+    Float x0 = dLocal.x, y0 = dLocal.y;
+    Float x1 = x0 + exl, y1 = y0 + eyl;
 
-    // create vectors to four vertices
+    // Find plane normals to rectangle edges and compute internal angles
     Vector3f v00(x0, y0, z0), v01(x0, y1, z0);
     Vector3f v10(x1, y0, z0), v11(x1, y1, z0);
-
-    // compute normals to edges
-    Vector3f n0 = Normalize(Cross(v00, v10));
-    Vector3f n1 = Normalize(Cross(v10, v11));
-    Vector3f n2 = Normalize(Cross(v11, v01));
-    Vector3f n3 = Normalize(Cross(v01, v00));
-
-    // compute internal angles (gamma_i)
+    Vector3f n0 = Normalize(Cross(v00, v10)), n1 = Normalize(Cross(v10, v11));
+    Vector3f n2 = Normalize(Cross(v11, v01)), n3 = Normalize(Cross(v01, v00));
     Float g0 = AngleBetween(-n0, n1);
     Float g1 = AngleBetween(-n1, n2);
     Float g2 = AngleBetween(-n2, n3);
     Float g3 = AngleBetween(-n3, n0);
 
-    // compute predefined constants
-    Float b0 = n0.z, b1 = n2.z, b0sq = Sqr(b0), b1sq = Sqr(b1);
-
-    // compute solid angle from internal angles
+    // Compute spherical rectangle solid angle and PDF
     Float solidAngle = double(g0) + double(g1) + double(g2) + double(g3) - 2. * Pi;
     CHECK_RARE(1e-5, solidAngle <= 0);
     if (solidAngle <= 0) {
@@ -264,38 +222,35 @@ Point3f SampleSphericalQuad(const Point3f &pRef, const Point3f &s, const Vector3
     }
     if (pdf != nullptr)
         *pdf = std::max<Float>(0, 1 / solidAngle);
-
     if (solidAngle < 1e-3)
         return Point3f(s + u[0] * ex + u[1] * ey);
 
-    // SphQuadSample
-    // 1. compute 'cu'
+    // Sample _cu_ for spherical rectangle sample
+    Float b0 = n0.z, b1 = n2.z;
     // Float au = u[0] * solidAngle + k;   // original
     Float au = u[0] * solidAngle - g2 - g3;
     Float fu = (std::cos(au) * b0 - b1) / std::sin(au);
-    Float fusq = Sqr(fu);
-    Float cu = std::copysign(1 / std::sqrt(Sqr(fu) + b0sq), fu);
+    Float cu = std::copysign(1 / std::sqrt(Sqr(fu) + Sqr(b0)), fu);
     cu = Clamp(cu, -OneMinusEpsilon, OneMinusEpsilon);  // avoid NaNs
 
-    // 2. compute 'xu'
+    // Find _xu_ along $x$ edge for spherical rectangle sample
     Float xu = -(cu * z0) / SafeSqrt(1 - Sqr(cu));
-    xu = Clamp(xu, x0, x1);  // avoid Infs
+    xu = Clamp(xu, x0, x1);
 
-    // 3. compute 'yv'
-    Float dd = std::sqrt(Sqr(xu) + z0sq);
-    Float h0 = y0 / std::sqrt(Sqr(dd) + y0sq);
-    Float h1 = y1 / std::sqrt(Sqr(dd) + y1sq);
+    // Find _xv_ along $y$ edge for spherical rectangle sample
+    Float dd = std::sqrt(Sqr(xu) + Sqr(z0));
+    Float h0 = y0 / std::sqrt(Sqr(dd) + Sqr(y0));
+    Float h1 = y1 / std::sqrt(Sqr(dd) + Sqr(y1));
     Float hv = h0 + u[1] * (h1 - h0), hvsq = Sqr(hv);
-    const Float eps = 1e-6;
-    Float yv = (hvsq < 1 - eps) ? (hv * dd) / std::sqrt(1 - hvsq) : y1;
+    Float yv = (hvsq < 1 - 1e-6f) ? (hv * dd) / std::sqrt(1 - hvsq) : y1;
 
-    // 4. transform (xu,yv,z0) to world coords
+    // Return spherical triangle sample in original coordinate system
     return pRef + R.FromLocal(Vector3f(xu, yv, z0));
 }
 
-Point2f InvertSphericalQuadSample(const Point3f &pRef, const Point3f &s,
-                                  const Vector3f &ex, const Vector3f &ey,
-                                  const Point3f &pQuad) {
+Point2f InvertSphericalRectangleSample(const Point3f &pRef, const Point3f &s,
+                                       const Vector3f &ex, const Vector3f &ey,
+                                       const Point3f &pQuad) {
     // TODO: Delete anything unused in the below...
 
     // SphQuadInit()
